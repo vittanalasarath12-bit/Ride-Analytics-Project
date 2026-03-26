@@ -1,0 +1,183 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, dev ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    # Set timeout to prevent hanging jobs
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Set up PYTHONPATH
+        run: |
+          echo "PYTHONPATH=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+      
+      - name: Install dependencies
+        run: |
+          pip install flake8 black
+      
+      - name: Lint with flake8
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+          flake8 spark/jobs --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 spark/jobs --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      
+      - name: Check code formatting with black
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+          black --check spark/jobs
+
+  test-spark:
+    runs-on: ubuntu-latest
+    needs: lint  # Run only after lint passes
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Install Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r spark/requirements.txt
+          pip install pytest pytest-cov
+      
+      - name: Set up environment variables for PySpark
+        run: |
+          # Get Python executable path
+          PYTHON_EXEC=$(which python)
+          echo "PYSPARK_PYTHON=${PYTHON_EXEC}" >> $GITHUB_ENV
+          echo "PYSPARK_DRIVER_PYTHON=${PYTHON_EXEC}" >> $GITHUB_ENV
+          # Set PYTHONPATH to project root for module imports
+          echo "PYTHONPATH=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+          echo "Python executable: ${PYTHON_EXEC}"
+          echo "PYTHONPATH set to: ${GITHUB_WORKSPACE}"
+      
+      - name: Verify Python and Java setup
+        run: |
+          python --version
+          java -version
+          echo "PYSPARK_PYTHON: $PYSPARK_PYTHON"
+          echo "PYSPARK_DRIVER_PYTHON: $PYSPARK_DRIVER_PYTHON"
+          echo "PYTHONPATH: $PYTHONPATH"
+      
+      - name: Run Spark tests with coverage
+        id: test-spark
+        working-directory: spark
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+          pytest tests/ -v --cov=jobs --cov-report=xml --cov-report=html --cov-report=term-missing
+          # If we reach here, tests passed
+          echo "✅ All Spark tests passed"
+      
+      - name: Upload coverage to Codecov
+        if: success() || failure()  # Upload coverage even if tests fail (for analysis)
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./spark/coverage.xml
+          flags: spark
+          fail_ci_if_error: false  # Don't fail CI if Codecov upload fails
+      
+      - name: Upload HTML coverage report as artifact
+        if: success() || failure()  # Upload coverage even if tests fail (for analysis)
+        uses: actions/upload-artifact@v4
+        with:
+          name: spark-coverage-report
+          path: spark/htmlcov/
+          retention-days: 30
+      
+      - name: Display coverage summary
+        if: always()  # Always run to show test results
+        working-directory: spark
+        run: |
+          echo "## 📊 Spark Test Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage.xml ]; then
+            echo "✅ Coverage report generated successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📦 **Coverage artifacts:**" >> $GITHUB_STEP_SUMMARY
+            echo "- HTML report: Download from 'Artifacts' section above" >> $GITHUB_STEP_SUMMARY
+            echo "- XML report: Uploaded to Codecov" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Coverage report not found" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** If tests failed, the workflow will be marked as failed. Check test logs above for details." >> $GITHUB_STEP_SUMMARY
+
+  validate-airflow:
+    runs-on: ubuntu-latest
+    needs: test-spark  # Run only after tests pass
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      
+      - name: Set up PYTHONPATH
+        run: |
+          echo "PYTHONPATH=${GITHUB_WORKSPACE}" >> $GITHUB_ENV
+      
+      - name: Validate DAG Python syntax
+        working-directory: airflow
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+          echo "Validating DAG Python syntax..."
+          
+          # Check each DAG file for Python syntax errors
+          for dag_file in dags/*.py; do
+            if [ -f "$dag_file" ]; then
+              echo "Checking syntax: $dag_file"
+              python -m py_compile "$dag_file" || {
+                echo "❌ Syntax error in $dag_file"
+                exit 1
+              }
+              echo "  ✅ Syntax valid"
+            fi
+          done
+          echo "✅ All DAG files have valid Python syntax"
+      
+      - name: Validate DAG structure (basic checks)
+        working-directory: airflow
+        run: |
+          set -e  # Exit immediately if a command exits with a non-zero status
+          echo "Validating DAG structure..."
+          
+          # Simple validation: check that DAG files exist and have basic structure
+          for dag_file in dags/*.py; do
+            if [ -f "$dag_file" ]; then
+              echo "Checking structure: $dag_file"
+              # Check if file contains DAG definition
+              if grep -q "DAG(" "$dag_file" || grep -q "with DAG" "$dag_file"; then
+                echo "  ✅ Contains DAG definition"
+              else
+                echo "  ⚠️  Does not contain explicit DAG definition (may use decorators)"
+              fi
+              # Check file is not empty
+              if [ ! -s "$dag_file" ]; then
+                echo "  ❌ File is empty"
+                exit 1
+              fi
+            fi
+          done
+          echo "✅ All DAG files passed basic structure validation"
+
